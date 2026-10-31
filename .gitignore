@@ -1,0 +1,7 @@
+# engram-memory:standard=cb6f416bc296ac95 written by engram-memory-kit; a line of your own here stops its updates
+.engram/engram.db
+.engram/engram.db-*
+.engram/.sync.lock/
+.engram/.sanitize.log
+__pycache__/
+*.pyc

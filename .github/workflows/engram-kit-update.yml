@@ -1,0 +1,512 @@
+# engram-kit-update: written by engram-memory-kit, do not edit by hand (a new version of the kit replaces it).
+# Every week it reads the kit at its default branch, runs that kit's own init command on this repository and looks at the
+# result. It runs on GitHub, so it changes nothing on a developer's machine, and it never merges nor pushes to the default branch.
+#
+# Nothing changed: nothing happens. Something changed: ONE pull request on one fixed branch, updated on later weeks. Actions
+# may not open pull requests here: one issue saying what to enable. The kit cannot be read: one issue naming the secret.
+# The kit refused to change a file: one issue naming it.
+#
+# The code of the kit runs only in the first job, which can write nothing and holds no token that can. The second job can
+# write and runs no code of the kit: what it receives is a patch, and a person reviews it before it reaches anybody.
+name: engram-kit-update
+
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two runs at once could open two pull requests or two issues.
+concurrency:
+  group: engram-kit-update
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      state: ${{ steps.compare.outputs.state }}
+      kit_commit: ${{ steps.compare.outputs.kit_commit }}
+      key_is_set: ${{ steps.compare.outputs.key_is_set }}
+      workflow_changed: ${{ steps.compare.outputs.workflow_changed }}
+    steps:
+      # If the event does not carry the default branch, ref is empty and the action takes the ref of the event, which for a
+      # schedule is the default branch.
+      - name: This repository, at its default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: repository
+          persist-credentials: false
+
+      # With no secret, ssh-key is empty and the action reads over HTTPS with the token of this run, which reaches a public
+      # kit only. persist-credentials: false removes the key before any code of the kit runs.
+      - name: The kit, at its default branch
+        id: kit
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: juankmilo65/engram-memory-kit
+          path: kit
+          ssh-key: ${{ secrets.ENGRAM_KIT_SSH_KEY }}
+          persist-credentials: false
+
+      - name: Compare this repository with the kit
+        id: compare
+        env:
+          KIT_OUTCOME: ${{ steps.kit.outcome }}
+          KEY_IS_SET: ${{ secrets.ENGRAM_KIT_SSH_KEY != '' }}
+        run: |
+          out="$RUNNER_TEMP/engram-kit-update"
+          workflow=.github/workflows/engram-kit-update.yml
+          mkdir -p "$out"
+          echo "key_is_set=$KEY_IS_SET" >> "$GITHUB_OUTPUT"
+          if [ "$KIT_OUTCOME" != success ]; then
+            echo 'The kit could not be read.' | tee "$out/init.log"
+            echo 'state=kit-unreadable' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          commit="$(git -C kit rev-parse HEAD)"
+          echo "kit_commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "The kit is at $commit"
+
+          # 0: it follows the standard. 1: something was refused and needs a person. Anything else: it did not run.
+          rc=0
+          python3 kit/engram_memory_kit.py init-memory --project kit_update_sandbox --force --no-git --account juankmilo65 --path repository > "$out/init.log" 2>&1 || rc=$?
+          cat "$out/init.log"
+          # Python also ends with 1 when it crashes, so a 1 is a refusal only when the kit named what it refused and did not crash.
+          if [ "$rc" = 1 ] && { ! grep -Eq '^(DIFFERS|REFUSED)' "$out/init.log" || grep -q '^Traceback ' "$out/init.log"; }; then
+            rc=2
+          fi
+          if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then
+            echo 'state=init-failed' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # GITHUB_TOKEN may not push a change to a workflow file, so this file never goes in the patch.
+          git -C repository add --all
+          git -C repository diff --cached --binary -- . ":(exclude)$workflow" > "$out/change.patch"
+          workflow_changed=false
+          git -C repository diff --cached --quiet -- "$workflow" || workflow_changed=true
+          echo "workflow_changed=$workflow_changed" >> "$GITHUB_OUTPUT"
+
+          if [ -s "$out/change.patch" ]; then
+            state=change
+          elif [ "$workflow_changed" = true ]; then
+            state=workflow-only
+          elif [ "$rc" = 1 ]; then
+            state=refused
+          else
+            state=no-change
+          fi
+          if [ "$rc" = 1 ]; then
+            echo '::warning::the kit refused to change some files of this repository, see the log of this step'
+          fi
+          echo "This repository, compared with the kit: $state"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Keep what it found for the next job
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: engram-kit-update
+          path: ${{ runner.temp }}/engram-kit-update/
+          retention-days: 3
+
+  propose:
+    needs: compare
+    if: ${{ !cancelled() && needs.compare.outputs.state != 'no-change' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: This repository, at its default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: What the first job found
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: engram-kit-update
+          path: ${{ runner.temp }}/engram-kit-update
+
+      - name: One pull request, or one issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          KIT_REPOSITORY: juankmilo65/engram-memory-kit
+          STATE: ${{ needs.compare.outputs.state }}
+          KIT_COMMIT: ${{ needs.compare.outputs.kit_commit }}
+          KEY_IS_SET: ${{ needs.compare.outputs.key_is_set }}
+          WORKFLOW_CHANGED: ${{ needs.compare.outputs.workflow_changed }}
+        run: |
+          found="$RUNNER_TEMP/engram-kit-update"
+          body="$RUNNER_TEMP/body.md"
+          branch=engram-kit-update/from-kit
+          by_hand="$(cat <<'BY_HAND'
+          python3 <kit>/engram_memory_kit.py init-memory --project kit_update_sandbox --force --no-git --account juankmilo65 --path .
+          BY_HAND
+          )"
+
+          # The open issue with exactly this title, if there is one.
+          open_issue() {
+            gh issue list --state open --search "\"$1\" in:title" --json number,title --jq ".[] | select(.title == \"$1\") | .number" | head -n 1
+          }
+
+          # one_issue <title>: from the body file, unless one with that title is open already. Later weeks add nothing.
+          one_issue() {
+            if [ -n "$(open_issue "$1")" ]; then
+              echo "Already open: $1"
+            else
+              gh issue create --title "$1" --body-file "$body"
+            fi
+            echo "::warning::$1"
+          }
+
+          # A refusal never stays silent: this repository would stay behind the kit on a green run. One issue per text of the
+          # refusal. An open one is brought up to date, and a closed one with the same text means a person has seen it.
+          refused="$(grep -E '^(DIFFERS|REFUSED)' "$found/init.log" 2>/dev/null || true)"
+          # A kit that did not finish has its own issue, and what it printed before that is not a refusal to act on.
+          if [ -n "$refused" ] && [ "$STATE" != init-failed ]; then
+            title='engram-kit-update: the kit refused to change some files of this repository'
+            fingerprint="refusal $(printf '%s\n' "$refused" | git hash-object --stdin --no-filters)"
+            {
+              echo "The kit \`$KIT_REPOSITORY\` at \`$KIT_COMMIT\` left these files as they are, because they could hold something of this repository. Until a person acts they stay behind the kit, and the weekly run stays green. Each line says what to do:"
+              echo
+              echo '```'
+              printf '%s\n' "$refused"
+              echo '```'
+              echo
+              echo 'Closing this without fixing it is a decision too: no new issue opens until the kit says something different about these files.'
+              echo
+              echo "Run: $RUN_URL"
+              echo
+              echo "<!-- $fingerprint -->"
+            } > "$body"
+            open_one=''
+            seen=false
+            while read -r issue_state number; do
+              if [ "$issue_state" = OPEN ]; then
+                open_one="$number"
+              else
+                text="$(gh issue view "$number" --json body --jq '.body')"
+                case "$text" in *"$fingerprint"*) seen=true ;; esac
+              fi
+            done < <(gh issue list --state all --search "\"$title\" in:title" --json number,state,title --jq ".[] | select(.title == \"$title\") | .state + \" \" + (.number | tostring)")
+            if [ -n "$open_one" ]; then
+              gh issue edit "$open_one" --body-file "$body"
+            elif [ "$seen" = true ]; then
+              echo 'A person closed the issue with this same refusal: no new one.'
+            else
+              gh issue create --title "$title" --body-file "$body"
+            fi
+            echo "::warning::$title"
+          fi
+
+          case "$STATE" in
+            refused)
+              exit 0
+              ;;
+            kit-unreadable)
+              {
+                echo "This repository updates itself from \`$KIT_REPOSITORY\` every week, and this week it could not read it, so it did not compare anything."
+                echo
+                if [ "$KEY_IS_SET" = true ]; then
+                  echo 'The secret `ENGRAM_KIT_SSH_KEY` is set, and it did not work: the key may be wrong, or it was removed from the deploy keys of the kit, or GitHub had a bad moment. The log of the run says which.'
+                else
+                  echo 'The secret `ENGRAM_KIT_SSH_KEY` is **not set** in this repository, and the kit is not public.'
+                fi
+                echo
+                echo 'A person with admin rights does this once. The key can only read the kit:'
+                echo
+                echo '```sh'
+                echo 'ssh-keygen -t ed25519 -N "" -C "engram-kit-update" -f engram-kit-key'
+                echo "gh repo deploy-key add engram-kit-key.pub --repo $KIT_REPOSITORY --title \"engram-kit-update $GH_REPO\""
+                echo "gh secret set ENGRAM_KIT_SSH_KEY --repo $GH_REPO < engram-kit-key"
+                echo 'rm engram-kit-key engram-kit-key.pub'
+                echo '```'
+                echo
+                echo 'Then close this issue and start the workflow by hand (Actions, engram-kit-update, Run workflow). If it still fails, the next run opens a new issue.'
+                echo
+                echo "Run: $RUN_URL"
+              } > "$body"
+              one_issue 'engram-kit-update: the kit cannot be read (secret ENGRAM_KIT_SSH_KEY)'
+              exit 0
+              ;;
+            init-failed)
+              {
+                echo "The kit \`$KIT_REPOSITORY\` at \`$KIT_COMMIT\` did not run on this repository, so nothing was compared. Nothing was changed. What it said:"
+                echo
+                echo '```'
+                tail -n 20 "$found/init.log"
+                echo '```'
+                echo
+                echo 'Fix what it names and close this issue. If it still fails, the next run opens a new issue.'
+                echo
+                echo "Run: $RUN_URL"
+              } > "$body"
+              one_issue 'engram-kit-update: the kit could not run on this repository'
+              exit 0
+              ;;
+            workflow-only)
+              {
+                echo "The only difference with \`$KIT_REPOSITORY\` at \`$KIT_COMMIT\` is the file of this workflow, \`.github/workflows/engram-kit-update.yml\`, and the token of a workflow may not change a workflow file. A person does it once, on a branch:"
+                echo
+                echo '```sh'
+                echo "$by_hand"
+                echo '```'
+                echo
+                echo 'Commit that one file in a pull request and close this issue.'
+                echo
+                echo "Run: $RUN_URL"
+              } > "$body"
+              one_issue 'engram-kit-update: the workflow itself changed, a person updates it'
+              exit 0
+              ;;
+            change)
+              ;;
+            *)
+              {
+                echo 'The first job of this workflow ended without saying what it found, so nothing was compared. Look at the log of the run.'
+                echo
+                echo "Run: $RUN_URL"
+              } > "$body"
+              one_issue 'engram-kit-update: the comparison with the kit did not finish'
+              exit 1
+              ;;
+          esac
+
+          title='chore(engram): bring the standard of engram-memory-kit'
+          short="$(printf '%s' "$KIT_COMMIT" | cut -c1-12)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Asked of GitHub, not read from the event: the event may not carry it on a schedule.
+          default_branch="$(gh api "repos/$GH_REPO" --jq '.default_branch')"
+          if [ -z "$default_branch" ]; then
+            echo 'GitHub did not say which is the default branch of this repository.' >&2
+            exit 1
+          fi
+          git fetch -q --depth=1 origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch"
+          git switch -q --no-track -c "$branch" "refs/remotes/origin/$default_branch"
+
+          # The real boundary: the code of the kit ran in the first job, so what it handed over is not trusted. This list is in
+          # this file, which only a person can change. A symlink, a submodule or a deletion is refused on any path.
+          refuse_patch() {
+            {
+              echo "The kit \`$KIT_REPOSITORY\` at \`$KIT_COMMIT\` proposed something that this workflow does not take, so nothing was pushed:"
+              echo
+              printf '%s\n' "$1"
+              echo
+              echo 'Either a newer kit has a new standard file, and a person updates this workflow on a branch, which brings its list:'
+              echo
+              echo '```sh'
+              echo "$by_hand"
+              echo '```'
+              echo
+              echo 'Or that commit of the kit should not be trusted, so look at it before anything else. Then close this issue.'
+              echo
+              echo "Run: $RUN_URL"
+            } > "$body"
+            one_issue 'engram-kit-update: the patch of the kit was refused'
+          }
+          allowed="$RUNNER_TEMP/standard-paths"
+          cat > "$allowed" <<'STANDARD_PATHS'
+          .engram/config.json
+          .engram/manifest.json
+          .gitignore
+          README.md
+          tests/test_encoding.py
+          tests/test_hardening.py
+          tests/test_merge_manifest.py
+          tests/test_sanitize_chunks.py
+          tests/test_setup_script.py
+          tests/test_sync_script.py
+          tests/test_unicode_forms.py
+          tests/windows_support.py
+          tools/engram-memory-sync.sh
+          tools/find-python.sh
+          tools/merge_manifest.py
+          tools/sanitize_chunks.py
+          tools/setup.sh
+          STANDARD_PATHS
+          if ! said="$(git apply --cached --binary --whitespace=nowarn "$found/change.patch" 2>&1)"; then
+            refuse_patch "It cannot be applied here: $said"
+            exit 1
+          fi
+          outside=''
+          git -c core.quotePath=false diff --cached --raw --no-renames --no-abbrev > "$RUNNER_TEMP/staged.raw"
+          while IFS=$'\t' read -r meta path; do
+            # shellcheck disable=SC2086
+            set -- $meta
+            mode="$2"
+            status="$5"
+            case "$status:$mode" in
+              A:100644 | A:100755 | M:100644 | M:100755)
+                grep -Fxq -- "$path" "$allowed" || outside="$outside- \`$path\` is not one of the standard files of this repository"$'\n'
+                ;;
+              *)
+                outside="$outside- \`$path\`: status $status, mode $mode"$'\n'
+                ;;
+            esac
+          done < "$RUNNER_TEMP/staged.raw"
+          if [ -n "$outside" ]; then
+            refuse_patch "$outside"
+            exit 0
+          fi
+          # The commit records the patch it brought, so what sits on top of it on the branch is the work of a person.
+          patch_id="$(git hash-object --no-filters "$found/change.patch")"
+          git commit -q -m "$title $short" -m "$KIT_REPOSITORY@$KIT_COMMIT" -m "Engram-Kit-Patch: $patch_id"
+
+          # create: no branch yet. none: it holds this already. move: only this workflow wrote it, so it follows. keep: a person
+          # added to it and the kit proposes the same as then, so it stays. replace: a person added to it and the kit proposes
+          # something new, so it is replaced, after saving what it held on another branch.
+          action=create
+          tip=''
+          saved=''
+          if git fetch -q --depth=50 origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null; then
+            tip="$(git rev-parse "refs/remotes/origin/$branch")"
+            ours="$(git log -n 1 --format=%H --grep='^Engram-Kit-Patch: ' "$tip")"
+            brought=''
+            on_top=1
+            if [ -n "$ours" ]; then
+              brought="$(git log -n 1 --format=%B "$ours" | sed -n 's/^Engram-Kit-Patch: //p')"
+              on_top="$(git rev-list --count "$ours..$tip")"
+            fi
+            if [ "$on_top" != 0 ]; then
+              if [ "$brought" = "$patch_id" ]; then action=keep; else action=replace; fi
+            elif [ "$(git rev-parse "$tip^{tree}")" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+              action=none
+            else
+              action=move
+            fi
+          fi
+          replaced_note="$RUNNER_TEMP/replaced.md"
+          if [ "$action" = replace ]; then
+            saved="engram-kit-update/replaced-$(printf '%s' "$tip" | cut -c1-12)"
+            where="They are saved on the branch \`$saved\`."
+            git push -q origin "$tip:refs/heads/$saved" || where='GitHub did not take a branch to save them on, so that commit is the only way to find them.'
+            echo "**The kit proposes something new, so the branch \`$branch\` was replaced, and the commits made by hand on it are no longer in this pull request.** It was at \`$tip\`. $where Bring back what still matters." > "$replaced_note"
+          fi
+
+          {
+            echo "This brings the standard of \`$KIT_REPOSITORY\` at commit \`$KIT_COMMIT\`. Nothing merges by itself."
+            echo
+            echo '## What a reviewer looks at'
+            echo
+            echo '- The files come from the kit, so the question is whether they belong here, not each line. What this repository had of its own is listed under "Refused" and was not touched.'
+            echo '- `.husky/`, `scripts/engram-memory/`, `tools/`, `package.json` and `.claude/settings.json` run on the machine of every developer after the merge. Read those.'
+            echo '- The generated tests are formatted with the options of the kit (prettier: `semi`, `singleQuote`, `printWidth: 100`, `trailingComma: es5`, `arrowParens: always`, `endOfLine: lf`), and no formatter of this repository ran on them. If its formatter differs, a check of its format can fail here: add that folder to its ignore list on the default branch, where it lasts. On this branch it also works, until the kit proposes something new.'
+            echo
+            echo '## Its checks may need a person'
+            echo
+            echo 'GitHub holds the checks of a pull request opened by the token of a workflow: a banner in the merge box lets a person with write access start them with **Approve workflows to run**. If there is no banner and no checks, GitHub started none: close this and reopen it, which starts them.'
+            echo
+            echo '## Changed'
+            echo
+            echo '```'
+            git diff --stat HEAD~1 HEAD
+            echo '```'
+            if [ -n "$refused" ]; then
+              echo
+              echo '## Refused: these need a person'
+              echo
+              echo 'The kit left these as they are, because they hold something of this repository:'
+              echo
+              echo '```'
+              printf '%s\n' "$refused"
+              echo '```'
+            fi
+            if [ "$WORKFLOW_CHANGED" = true ]; then
+              echo
+              echo '## The workflow itself changed'
+              echo
+              echo 'The token of a workflow may not change a workflow file, so `.github/workflows/engram-kit-update.yml` is not in this pull request. A person runs this on a branch and commits that one file:'
+              echo
+              echo '```sh'
+              echo "$by_hand"
+              echo '```'
+            fi
+            echo
+            echo '## Later weeks'
+            echo
+            if [ "$action" = keep ]; then
+              echo "The branch \`$branch\` holds commits made by hand on top of what the kit proposes. They are part of what you review here."
+              echo
+            elif [ "$action" = replace ]; then
+              cat "$replaced_note"
+              echo
+            fi
+            echo "A commit made by hand on \`$branch\` stays there while the kit proposes this same change, also when the default branch moves. When the kit proposes something new, the branch is replaced, and a comment here says where those commits were saved. Something meant to last goes on the default branch. Closing this without merging brings another one next week, as long as the difference is there."
+            echo
+            echo "Run: $RUN_URL"
+          } > "$body"
+
+          # Anything else that mentions a workflow is not this, and a branch with an open pull request stays where it is.
+          case "$action" in
+            create)
+              git push -q origin "$branch"
+              ;;
+            move | replace)
+              if ! said="$(git push -q --force-with-lease="$branch:$tip" origin "$branch" 2>&1)"; then
+                # GitHub refuses a token that would change a workflow file. If this commit touches none and the default branch
+                # got a workflow change since the old branch, that move is what it refused, and a new branch does not count as
+                # one. Deleting the branch closes its pull request, and one opens again below.
+                if case "$said" in *'to create or update workflow'*) true ;; *) false ;; esac \
+                  && git diff --quiet HEAD~1 HEAD -- .github/workflows \
+                  && ! git diff --quiet "$tip" HEAD -- .github/workflows; then
+                  echo 'The branch cannot move over a workflow change of the default branch: it starts again.'
+                  git push -q origin --delete "$branch"
+                  git push -q origin "$branch"
+                else
+                  printf '%s\n' "$said" >&2
+                  exit 1
+                fi
+              fi
+              ;;
+          esac
+
+          pr="$(gh pr list --state open --head "$branch" --json number --jq '.[].number' | head -n 1)"
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --body-file "$body"
+            if [ "$action" = replace ]; then
+              gh pr comment "$pr" --body-file "$replaced_note"
+            fi
+            echo "Pull request $pr now holds this."
+          elif said="$(gh pr create --base "$default_branch" --head "$branch" --title "$title" --body-file "$body" 2>&1)"; then
+            echo "Pull request opened: $said"
+          else
+            case "$said" in
+              *'not permitted to create'*)
+                {
+                  echo "The kit \`$KIT_REPOSITORY\` at \`$KIT_COMMIT\` has an update for this repository, and it is on the branch \`$branch\`, but Actions may not open pull requests here."
+                  echo
+                  echo 'A person with admin rights does this once: **Settings, Actions, General, Workflow permissions**, and tick **Allow GitHub Actions to create and approve pull requests**. If it is greyed out, the same setting of the organization comes first.'
+                  echo
+                  echo 'Then close this issue and start the workflow by hand (Actions, engram-kit-update, Run workflow).'
+                  echo
+                  echo "Run: $RUN_URL"
+                } > "$body"
+                one_issue 'engram-kit-update: Actions may not open pull requests in this repository'
+                ;;
+              *)
+                printf '%s\n' "$said" >&2
+                exit 1
+                ;;
+            esac
+          fi
