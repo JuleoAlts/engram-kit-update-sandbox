@@ -58,4 +58,3 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     sys.exit(main(Path(sys.argv[1]).resolve()))
-# stale line: this copy is behind the kit
